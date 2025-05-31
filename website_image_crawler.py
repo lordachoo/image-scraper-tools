@@ -11,6 +11,7 @@ import time
 import random
 import argparse
 import urllib.parse
+import cloudscraper
 from urllib.parse import urlparse, urljoin
 from concurrent.futures import ThreadPoolExecutor
 import requests
@@ -47,8 +48,29 @@ class WebsiteImageCrawler:
         self.max_retries = max_retries
         self.verbose = verbose
         
+        # Use browser-like headers to avoid being blocked by anti-scraping measures
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Referer': 'https://www.google.com/',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Cache-Control': 'max-age=0',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'cross-site',
+            'Sec-Fetch-User': '?1'
+        }
+        
         # Create a requests session for connection pooling
         self.session = requests.Session()
+        self.session.headers.update(self.headers)
+        
+        # Create a cloudscraper session for bypassing Cloudflare protection
+        self.cloudscraper_session = cloudscraper.create_scraper()
+        self.cloudscraper_session.headers.update(self.headers)
         
         # Set a realistic user agent if none provided
         if user_agent:
@@ -126,8 +148,25 @@ class WebsiteImageCrawler:
                 
                 # Extract images from the page
                 page_images = self._extract_images(html_content, page_url)
+                new_images = [img for img in page_images if img not in self.image_urls]
                 self.image_urls.update(page_images)
-                logger.info(f"Found {len(page_images)} images on {page_url}")
+                logger.info(f"Found {len(page_images)} images on {page_url} ({len(new_images)} new)")
+                
+                # Download the new images immediately (up to max_images limit)
+                if new_images and len(self.downloaded_images) < self.max_images:
+                    # Calculate how many more images we can download
+                    remaining = self.max_images - len(self.downloaded_images)
+                    # Take only what we need to reach the max
+                    images_to_download = new_images[:remaining]
+                    logger.info(f"Downloading {len(images_to_download)} images from {page_url}...")
+                    
+                    # Download the images
+                    new_downloads = self.download_images(images_to_download, self.formats)
+                    self.downloaded_images.extend(new_downloads)
+                    
+                    # Check if we've reached our limit
+                    if len(self.downloaded_images) >= self.max_images:
+                        logger.info(f"Reached maximum of {self.max_images} images. Stopping downloads.")
                 
                 # Extract links if we haven't reached maximum depth
                 if current_depth < depth:
@@ -142,12 +181,15 @@ class WebsiteImageCrawler:
                 
                 # Respect the site by waiting between requests
                 time.sleep(self.delay)
-        
-        # Download all found images (up to max_images)
-        image_list = list(self.image_urls)[:self.max_images]
-        logger.info(f"Downloading up to {len(image_list)} images...")
-        
-        self.downloaded_images = self.download_images(image_list, self.formats)
+                
+                # Stop crawling if we've reached our image limit
+                if len(self.downloaded_images) >= self.max_images:
+                    logger.info(f"Reached maximum of {self.max_images} images. Stopping crawl.")
+                    return {
+                        'downloaded_images': self.downloaded_images,
+                        'visited_pages': list(self.visited_urls),
+                        'total_images_found': len(self.image_urls)
+                    }
         
         return {
             'downloaded_images': self.downloaded_images,
@@ -156,29 +198,166 @@ class WebsiteImageCrawler:
         }
     
     def _fetch_url(self, url):
-        """Fetch the content of a URL with retries
+        
+        # Use a realistic referer if we're not on the first page
+        if len(self.visited_urls) > 0:
+            # Set referer to a previously visited page from the same domain
+            parsed_url = urllib.parse.urlparse(url)
+            domain = parsed_url.netloc
+            referers = [u for u in self.visited_urls if urllib.parse.urlparse(u).netloc == domain]
+            if referers:
+                self.session.headers.update({'Referer': random.choice(referers)})
+            else:
+                # Default to the site's homepage as referer
+                homepage = f"{parsed_url.scheme}://{parsed_url.netloc}/"
+                self.session.headers.update({'Referer': homepage})
+        
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                # Slightly randomize the user agent occasionally to appear more human-like
+                if random.random() < 0.2:  # 20% chance to change user agent
+                    self.session.headers.update({
+                        'User-Agent': random.choice([
+                            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15',
+                            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36',
+                            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:90.0) Gecko/20100101 Firefox/90.0'
+                        ])
+                    })
+                
+                # Make the request with cookie handling enabled
+                # Try with cloudscraper first for known Cloudflare-protected domains
+                parsed_url = urllib.parse.urlparse(url)
+                domain = parsed_url.netloc
+                
+                # List of known domains that use Cloudflare protection
+                cloudflare_domains = ['imfdb.org', 'wikia.com', 'fandom.com']
+                
+                if any(cf_domain in domain for cf_domain in cloudflare_domains):
+                    logger.info(f"Using cloudscraper for known Cloudflare-protected domain: {domain}")
+                    try:
+                        scraper_response = self.cloudscraper_session.get(url, timeout=30)
+                        scraper_response.raise_for_status()
+                        return scraper_response.text
+                    except Exception as cf_error:
+                        logger.warning(f"Cloudscraper failed for {url}: {cf_error}, falling back to regular requests")
+                        # Fall through to regular requests as a backup
+                
+                # Regular request handling
+                try:
+                    response = self.session.get(url, timeout=15, allow_redirects=True)
+                    response.raise_for_status()
+                    
+                    # If we got here, save any cookies the site set
+                    if len(response.cookies) > 0:
+                        logger.debug(f"Received cookies from {url}: {dict(response.cookies)}")
+                    
+                    return response.text
+                except requests.exceptions.HTTPError as e:
+                    # If we get a 403 Forbidden, try cloudscraper as a fallback
+                    if e.response.status_code == 403:
+                        logger.info(f"Received 403 Forbidden, attempting to bypass with cloudscraper: {url}")
+                        try:
+                            # Use cloudscraper to bypass protection
+                            scraper_response = self.cloudscraper_session.get(url, timeout=30)
+                            scraper_response.raise_for_status()
+                            logger.info(f"Successfully bypassed protection for {url} using cloudscraper")
+                            return scraper_response.text
+                        except Exception as scraper_error:
+                            logger.error(f"Failed to bypass protection: {scraper_error}")
+                            raise e
+                    else:
+                        # Not a 403 error, re-raise the original error
+                        raise
+            except requests.RequestException as e:
+                logger.warning(f"Error fetching {url} (attempt {attempt}/{self.max_retries}): {e}")
+                if attempt < self.max_retries:
+                    # Use exponential backoff with some randomization
+                    backoff_time = self.delay * (2 ** (attempt - 1)) * (0.75 + 0.5 * random.random())
+                    time.sleep(backoff_time)
+                else:
+                    logger.error(f"Failed to fetch {url} after {self.max_retries} attempts")
+                    return None
+    
+    def _is_likely_image_url(self, url):
+        """Check if a URL is likely to point to an image file
         
         Args:
-            url (str): URL to fetch
+            url (str): URL to check
             
         Returns:
-            str or None: HTML content or None if failed
+            bool: True if URL likely points to an image, False otherwise
         """
-        for attempt in range(self.max_retries):
-            try:
-                response = self.session.get(url, timeout=10)
-                response.raise_for_status()
-                return response.text
-            except requests.RequestException as e:
-                logger.warning(f"Error fetching {url} (attempt {attempt+1}/{self.max_retries}): {e}")
-                if attempt < self.max_retries - 1:
-                    # Exponential backoff with jitter
-                    sleep_time = (2 ** attempt) + random.uniform(0, 1)
-                    time.sleep(sleep_time)
+        # Check for common image file extensions
+        parsed_url = urllib.parse.urlparse(url)
+        path = parsed_url.path.lower()
         
-        logger.error(f"Failed to fetch {url} after {self.max_retries} attempts")
-        return None
-    
+        # Skip obvious non-image URLs
+        if any(path.endswith(ext) for ext in [
+            '.js', '.css', '.woff', '.woff2', '.ttf', '.eot', '.svg', 
+            '.html', '.htm', '.php', '.pdf', '.xml', '.json'
+        ]):
+            return False
+            
+        # Check for common image extensions
+        if any(path.endswith(ext) for ext in [
+            '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tiff', '.ico'
+        ]):
+            return True
+            
+        # Check for common image path patterns
+        if any(pattern in path for pattern in ['/images/', '/img/', '/photos/', '/thumbnails/', 'image_', 'picture']):
+            return True
+            
+        # Check for image-serving domains
+        image_domains = ['img.', 'image.', 'images.', 'assets.', 'static.', 'cdn.', 'media.']
+        if any(domain in parsed_url.netloc for domain in image_domains):
+            return True
+        
+        # Check for contentstack.io domains (specific to Smith & Wesson site)
+        if 'contentstack.io' in parsed_url.netloc and any(ext in path for ext in ['jpg', 'jpeg', 'png', 'gif']):
+            return True
+            
+        return False
+        
+    def _extract_javascript_images(self, html_content, base_url):
+        """Extract image URLs from JavaScript content
+        
+        Args:
+            html_content (str): HTML content
+            base_url (str): Base URL for resolving relative URLs
+            
+        Returns:
+            set: Set of absolute image URLs
+        """
+        image_urls = set()
+        
+        # Pattern for contentstack.io images (specific to Smith & Wesson site)
+        pattern1 = r'"(https?://images\.contentstack\.io/v3/assets/[^"]*\.(?:jpg|jpeg|png|gif))"'
+        
+        # General pattern for image URLs in JavaScript strings
+        pattern2 = r'"(https?://[^"]*\.(?:jpg|jpeg|png|gif))"'
+        
+        # Try to find contentstack.io URLs
+        try:
+            matches = re.findall(pattern1, html_content)
+            for url in matches:
+                if self._is_likely_image_url(url):
+                    image_urls.add(url)
+        except Exception as e:
+            logger.warning(f"Error extracting contentstack URLs: {e}")
+            
+        # Try to find general image URLs
+        try:
+            matches = re.findall(pattern2, html_content)
+            for url in matches:
+                if self._is_likely_image_url(url):
+                    image_urls.add(url)
+        except Exception as e:
+            logger.warning(f"Error extracting general image URLs: {e}")
+            
+        return image_urls
+
     def _extract_images(self, html_content, base_url):
         """Extract image URLs from HTML content
         
@@ -195,13 +374,42 @@ class WebsiteImageCrawler:
         soup = BeautifulSoup(html_content, 'html.parser')
         image_urls = set()
         
-        # Extract from img tags
+        # Extract from img tags - both src and data- attributes used for lazy loading
         for img in soup.find_all('img'):
+            # Regular src attribute
             src = img.get('src')
             if src:
-                # Convert relative URLs to absolute
                 abs_url = urljoin(base_url, src)
                 image_urls.add(abs_url)
+            
+            # Check for lazy loading attributes
+            for attr in ['data-src', 'data-original', 'data-lazy-src', 'data-srcset', 'lazy-src']:
+                lazy_src = img.get(attr)
+                if lazy_src:
+                    abs_url = urljoin(base_url, lazy_src)
+                    image_urls.add(abs_url)
+            
+            # Handle srcset attribute (responsive images)
+            srcset = img.get('srcset')
+            if srcset:
+                # Parse srcset format: "url1 1x, url2 2x" or "url1 100w, url2 200w"
+                for src_item in srcset.split(','):
+                    src_parts = src_item.strip().split(' ')
+                    if src_parts and src_parts[0]:
+                        abs_url = urljoin(base_url, src_parts[0])
+                        image_urls.add(abs_url)
+        
+        # Extract from picture > source tags (modern responsive images)
+        for picture in soup.find_all('picture'):
+            for source in picture.find_all('source'):
+                # Handle srcset
+                srcset = source.get('srcset')
+                if srcset:
+                    for src_item in srcset.split(','):
+                        src_parts = src_item.strip().split(' ')
+                        if src_parts and src_parts[0]:
+                            abs_url = urljoin(base_url, src_parts[0])
+                            image_urls.add(abs_url)
         
         # Extract from CSS background images (simplified)
         style_tags = soup.find_all('style')
@@ -223,16 +431,32 @@ class WebsiteImageCrawler:
                     abs_url = urljoin(base_url, url)
                     image_urls.add(abs_url)
         
+        # Extract OpenGraph image meta tags
+        for meta in soup.find_all('meta'):
+            if meta.get('property') in ['og:image', 'twitter:image']:
+                content = meta.get('content')
+                if content:
+                    abs_url = urljoin(base_url, content)
+                    image_urls.add(abs_url)
+        
+        # Extract images from JavaScript/JSON data in script tags
+        js_images = self._extract_javascript_images(html_content, base_url)
+        image_urls.update(js_images)
+        logger.debug(f"Found {len(js_images)} images in JavaScript/JSON data")
+        
+        # Pre-filter URLs that are likely to be images
+        pre_filtered_urls = {url for url in image_urls if self._is_likely_image_url(url)}
+        
         # Filter by format if specified
         if self.formats:
             filtered_urls = set()
-            for url in image_urls:
+            for url in pre_filtered_urls:
                 ext = self._get_extension_from_url(url)
                 if ext in self.formats:
                     filtered_urls.add(url)
             return filtered_urls
         
-        return image_urls
+        return pre_filtered_urls
     
     def _extract_links(self, html_content, base_url):
         """Extract links from HTML content, ensuring they are from the same domain
@@ -277,35 +501,60 @@ class WebsiteImageCrawler:
         if not urls:
             logger.warning("No image URLs to download")
             return []
+        
+        # If we only have a few URLs, don't use batching
+        if len(urls) <= 5:
+            logger.info(f"Downloading {len(urls)} images...")
+            downloaded = []
+            for url in urls:
+                try:
+                    result = self.download_image(url, formats)
+                    if result:
+                        downloaded.append(result)
+                except Exception as e:
+                    logger.error(f"Error downloading {url}: {e}")
+            return downloaded
             
         # Process in batches to avoid overwhelming the server
-        batch_size = 10
+        batch_size = min(10, len(urls))
         downloaded = []
         
         for i in range(0, len(urls), batch_size):
             batch = urls[i:i + batch_size]
-            logger.info(f"\nProcessing batch {i//batch_size + 1}/{(len(urls)-1)//batch_size + 1} (images {i+1}-{min(i+batch_size, len(urls))})")
+            logger.info(f"Processing batch {i//batch_size + 1}/{(len(urls)-1)//batch_size + 1} (images {i+1}-{min(i+batch_size, len(urls))})")
             
             # Use ThreadPoolExecutor for concurrent downloads
+            successful_in_batch = 0
             with ThreadPoolExecutor(max_workers=5) as executor:
                 future_to_url = {executor.submit(self.download_image, url, formats): url for url in batch}
                 for future in future_to_url:
                     try:
-                        result = future.result()
+                        result = future.result(timeout=30)  # Add timeout to prevent hanging
                         if result:
                             downloaded.append(result)
+                            successful_in_batch += 1
                     except Exception as e:
-                        logger.error(f"Error in download thread: {e}")
+                        url = future_to_url[future]
+                        logger.error(f"Error downloading {url}: {e}")
             
-            # Show progress every 5 images
-            if (i + batch_size) % 5 == 0 or i + batch_size >= len(urls):
-                logger.info(f"Progress: {min(i + batch_size, len(urls))}/{len(urls)} in current batch")
+            # Show progress 
+            logger.info(f"Batch {i//batch_size + 1} complete: Downloaded {successful_in_batch}/{len(batch)} images")
                 
-            # Pause between batches
+            # Pause between batches if needed
             if i + batch_size < len(urls):
-                time.sleep(1)  # Avoid overwhelming the server
-            
-            logger.info(f"Batch {i//batch_size + 1} complete: Downloaded {len(downloaded) - i} images")
+                # Dynamic delay based on success rate to avoid rate limiting
+                success_rate = successful_in_batch / len(batch)
+                if success_rate < 0.3:  # If less than 30% success, increase delay
+                    pause = min(3.0, self.delay * 2)  # Cap at 3 seconds
+                    logger.warning(f"Low success rate ({success_rate:.1%}). Increasing delay to {pause}s")
+                    time.sleep(pause)
+                else:
+                    time.sleep(self.delay)  # Normal delay
+                
+        if downloaded:
+            logger.info(f"Successfully downloaded {len(downloaded)}/{len(urls)} images")
+        else:
+            logger.warning("Failed to download any images")
                 
         return downloaded
     
@@ -340,17 +589,24 @@ class WebsiteImageCrawler:
                     
                 # Check if format matches requested formats
                 if formats:
-                    format_matched = False
+                    # Check URL extension first (for sites using content negotiation)
+                    url_ext = self._get_extension_from_url(url).lower()
+                    url_format_matched = url_ext in formats
+                    
+                    # Then check content type
+                    content_format_matched = False
                     for fmt in formats:
                         if fmt.lower() in ['jpg', 'jpeg'] and 'jpeg' in content_type:
-                            format_matched = True
+                            content_format_matched = True
                             break
                         elif fmt.lower() in content_type:
-                            format_matched = True
+                            content_format_matched = True
                             break
                     
-                    if not format_matched:
-                        logger.info(f"Skipping image with format {content_type} - not in requested formats")
+                    # Accept if either URL extension or content-type matches the requested formats
+                    # This handles sites like BigCommerce that serve WebP despite .png/.jpg URL extensions
+                    if not (url_format_matched or content_format_matched):
+                        logger.info(f"Skipping image: URL ext={url_ext}, content-type={content_type} - not in requested formats {formats}")
                         return None
                 
                 # Get the image content
@@ -359,10 +615,22 @@ class WebsiteImageCrawler:
                 
                 # Determine the correct file extension based on Content-Type
                 content_type = response.headers.get('Content-Type', '').lower()
-                extension = self._get_extension_from_content_type(content_type)
-                if not extension:
-                    # Fallback to URL-based extension
-                    extension = self._get_extension_from_url(url)
+                content_type_extension = self._get_extension_from_content_type(content_type)
+                url_extension = self._get_extension_from_url(url)
+                
+                # If user requested specific formats and the URL has one of those extensions,
+                # use the URL extension instead of the content-type extension
+                # This handles cases where servers use content negotiation (e.g., returning WebP for PNG URLs)
+                if formats and url_extension in formats:
+                    extension = url_extension
+                    if content_type_extension and content_type_extension != url_extension:
+                        logger.warning(f"Format mismatch: URL suggests {extension} but server returned {content_type}. "
+                                       f"File will be saved with .{extension} extension but contains {content_type} data.")
+                    logger.debug(f"Format override: Using URL extension {extension} instead of content-type extension {content_type_extension}")
+                elif content_type_extension:
+                    extension = content_type_extension
+                else:
+                    extension = url_extension
                 
                 # Get the filename from response or URL
                 filename = self._get_filename(url, response)
